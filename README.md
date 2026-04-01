@@ -1,6 +1,6 @@
 # `strava`
 
-#### Minimal read-only CLI for [Strava](https://www.strava.com) (OAuth, list activities, fetch activity details)
+#### 🚴‍♂️🏋️‍♂️ Minimal read-only CLI for [Strava](https://www.strava.com) (OAuth, list activities, fetch activity details)
 
 ## Why
 
