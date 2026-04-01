@@ -403,7 +403,7 @@ const program = new Command();
 program
   .name('strava')
   .description(
-    'CLI to fetch latest activities from Strava (requires STRAVA_ACCESS_TOKEN, obtain via `strava auth`).'
+    'Read-only Strava CLI.\n\n1. Set `STRAVA_CLIENT_ID` and `STRAVA_CLIENT_SECRET`.\n2. Run `strava doctor` to verify.\n3. Run `strava auth` to get tokens (saved to ~/.strava-tokens.json (or STRAVA_STORAGE_PATH)).\n4. Run `strava activities` to list activities.\n5. Run `strava activity <id>` to get activity details.'
   );
 
 program

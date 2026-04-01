@@ -1,10 +1,10 @@
 # `strava`
 
-#### Minimal read-only CLI for [Strava](strava.com) (OAuth, list activities, fetch activity details)
+#### Minimal read-only CLI for [Strava](https://www.strava.com) (OAuth, list activities, fetch activity details)
 
 ## Why
 
-Strava has no official CLI and I wanted one that was read-only and with a source that’s small enough for me to be able to check what exactly it does. This CLI is read-only, a single file, and only ~650 lines.
+Strava has no official CLI and I wanted one that was read-only and with a source that’s small enough for me to be able to check what exactly it does. This CLI is read-only; the core logic lives in one module (~650 lines in `src/strava.ts`).
 
 ## Quick start
 

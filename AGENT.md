@@ -28,7 +28,7 @@ Always respond with a **short, human summary** of the results instead of raw JSO
 ## Requirements
 
 - **auth** and **refresh** need **STRAVA_CLIENT_ID** and **STRAVA_CLIENT_SECRET**. Tokens are stored in a file; path defaults to **~/.strava-tokens.json** unless **STRAVA_STORAGE_PATH** is set.
-- **activities** and **activity** read the access token from that tokens file (written by `strava auth` or `strava refresh`); you do not set `STRAVA_ACCESS_TOKEN` yourself.
+- **activities** and **activity** read the access token from that tokens file (written by `strava auth` or `strava refresh`); you do not set `STRAVA_ACCESS_TOKEN` yourself. At runtime they only need a **valid, non-expired** token file—they do not read client ID/secret (those are still required for **auth**, **refresh**, and **doctor**).
 - Run **`strava doctor`** to check env vars and whether auth is OK or needs refresh; use it when checking CLI health or troubleshooting.
 
 ### How to obtain the required env vars
@@ -41,21 +41,23 @@ Always respond with a **short, human summary** of the results instead of raw JSO
 2. **STRAVA_STORAGE_PATH** (optional)
    - Tokens are stored in a file. Default is **~/.strava-tokens.json**. Set this env var only if you want a different path (e.g. a path in your project). The file is created when you run `strava auth`.
 
-3. **Set the env vars** (e.g. in your shell or a `.env` file in the project root):
+3. **Set the env vars** in the **process environment**:
    - `STRAVA_CLIENT_ID=<your-client-id>`
    - `STRAVA_CLIENT_SECRET=<your-client-secret>`
    - Optionally: `STRAVA_STORAGE_PATH=/path/to/strava-tokens.json`
 
 4. **Get an access token:** run `strava auth`. A browser will open for Strava authorization; after you approve, tokens are written to the storage file (default `~/.strava-tokens.json`). The CLI then uses that file for `activities` and `activity`; no need to set any other env var. Use `strava refresh` when the access token has expired.
 
-If a required env var is missing:
+If **auth** / **refresh** / **doctor** fail because env vars are missing:
 
 - Tell the user **which variable is missing** and direct them to **How to obtain the required env vars** above.
 - Do not keep retrying the same failing command.
 
+If **activities** / **activity** fail, the cause may be a **missing token file**, **expired access token** (run `strava refresh` after setting client ID/secret), or **invalid JSON** in the storage file—not only missing env vars.
+
 ## How to run
 
-From **project root**:
+From a terminal with **`strava` on your `PATH`** (e.g. `bun add -g @kvendrik/strava`). The published binary is run with **Bun**; Bun must be installed and discoverable when the shim executes.
 
 ```bash
 strava <command> [options] [args]
@@ -141,7 +143,7 @@ strava activities --json
 
 ### activity \<id\>
 
-Fetch a single activity by ID with full details. Outputs JSON.
+Fetch a single activity by ID with full details. Outputs JSON. **`<id>` must be Strava’s numeric activity ID** (from `strava activities` / `--json` or the activity URL), not a name or slug—the CLI rejects non-numeric values.
 
 ```bash
 strava activity <id>
@@ -161,8 +163,3 @@ Once you have an ID, run `strava activity <id>`, then:
 
 - Summarize the key stats in a short bullet list.
 - Avoid dumping the full JSON unless the user explicitly asks for raw API output.
-
-## Notes
-
-- **activities** and **activity** read the access token from the tokens file (default `~/.strava-tokens.json`, written by `strava auth` or `strava refresh`).
-- Strava app **Authorization Callback Domain** must include `localhost`; the OAuth redirect URL is `http://localhost:8080` (or the chosen `--redirect-port`).
