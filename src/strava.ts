@@ -1,0 +1,644 @@
+import { spawnSync } from 'child_process';
+import { createServer } from 'http';
+import { Command } from 'commander';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+const STRAVA_API_BASE = 'https://www.strava.com/api/v3';
+const STRAVA_OAUTH_BASE = 'https://www.strava.com/oauth';
+const DEFAULT_REDIRECT_PORT = 8080;
+const ACTIVITY_READ_SCOPE = 'activity:read_all';
+
+interface SummaryActivity {
+  id: number;
+  name: string;
+  type: string;
+  sport_type: string;
+  start_date: string;
+  start_date_local: string;
+  elapsed_time: number;
+  moving_time: number;
+  distance: number;
+  total_elevation_gain?: number;
+  kudos_count?: number;
+}
+
+interface TokenResponse {
+  access_token: string;
+  refresh_token: string;
+  expires_at: number;
+  expires_in: number;
+  athlete?: unknown;
+}
+
+const DEFAULT_STORAGE_PATH = path.join(os.homedir(), '.strava-tokens.json');
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function parseJsonUnknown(text: string): unknown {
+  return JSON.parse(text);
+}
+
+function parseTokenResponse(data: unknown): TokenResponse {
+  if (!isRecord(data)) {
+    throw new Error('Invalid token response');
+  }
+  const access_token = data['access_token'];
+  const refresh_token = data['refresh_token'];
+  const expires_at = data['expires_at'];
+  const expires_in = data['expires_in'];
+  if (
+    typeof access_token !== 'string' ||
+    typeof refresh_token !== 'string' ||
+    typeof expires_at !== 'number' ||
+    typeof expires_in !== 'number'
+  ) {
+    throw new Error('Invalid token response');
+  }
+  const base: TokenResponse = {
+    access_token,
+    refresh_token,
+    expires_at,
+    expires_in,
+  };
+  if (!('athlete' in data)) {
+    return base;
+  }
+  return { ...base, athlete: data['athlete'] };
+}
+
+function oauthJsonErrorMessage(data: unknown, fallback: string): string {
+  if (isRecord(data) && typeof data['message'] === 'string') {
+    return data['message'];
+  }
+  return fallback;
+}
+
+function isSummaryActivity(value: unknown): value is SummaryActivity {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value['id'] === 'number' &&
+    typeof value['name'] === 'string' &&
+    typeof value['type'] === 'string' &&
+    typeof value['sport_type'] === 'string' &&
+    typeof value['start_date'] === 'string' &&
+    typeof value['start_date_local'] === 'string' &&
+    typeof value['elapsed_time'] === 'number' &&
+    typeof value['moving_time'] === 'number' &&
+    typeof value['distance'] === 'number'
+  );
+}
+
+function parseSummaryActivities(data: unknown): SummaryActivity[] {
+  if (!Array.isArray(data) || !data.every(isSummaryActivity)) {
+    throw new Error('Strava API returned invalid activities payload');
+  }
+  return data;
+}
+
+function parseJsonObject(data: unknown): Record<string, unknown> {
+  if (!isRecord(data)) {
+    throw new Error('Strava API returned invalid JSON object');
+  }
+  return data;
+}
+
+function getStoragePath(): string {
+  const raw = process.env['STRAVA_STORAGE_PATH']?.trim();
+  if (!raw) return DEFAULT_STORAGE_PATH;
+  if (raw === '~') return os.homedir();
+  if (raw.startsWith('~/')) return path.join(os.homedir(), raw.slice(2));
+  return raw;
+}
+
+function getTokens(): TokenResponse {
+  const storagePath = getStoragePath();
+  if (!fs.existsSync(storagePath)) {
+    throw new Error(
+      `Strava storage path (${storagePath}) does not exist. Run \`strava auth\` first.`
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseJsonUnknown(fs.readFileSync(storagePath, 'utf8'));
+  } catch {
+    throw new Error('Strava token file is not valid JSON.');
+  }
+  const tokens = parseTokenResponse(parsed);
+  if (!tokens.access_token) {
+    throw new Error(
+      'Strava access token not found in storage. Run `strava auth` first.'
+    );
+  }
+  if (!tokens.refresh_token) {
+    throw new Error(
+      'Strava refresh token not found in storage. Run `strava auth` first.'
+    );
+  }
+  if (tokens.expires_at < Date.now() / 1000) {
+    throw new Error(
+      'Strava access token has expired. Run `strava refresh` first.'
+    );
+  }
+  return tokens;
+}
+
+function getClientCredentials(): { clientId: string; clientSecret: string } {
+  const clientId = process.env['STRAVA_CLIENT_ID']?.trim();
+  const clientSecret = process.env['STRAVA_CLIENT_SECRET']?.trim();
+  if (!clientId || !clientSecret) {
+    console.error(
+      'STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET are required (env or --client-id / --client-secret).'
+    );
+    process.exit(1);
+  }
+  return { clientId, clientSecret };
+}
+
+function openUrl(url: string): void {
+  const platform = process.platform;
+  const [cmd, ...args] =
+    platform === 'darwin'
+      ? ['open', url]
+      : platform === 'win32'
+        ? ['cmd', '/c', 'start', url]
+        : ['xdg-open', url];
+  const result = spawnSync(cmd, args, { stdio: 'ignore' });
+  if (result.error) {
+    console.error('Could not open browser. Visit this URL manually:\n', url);
+  }
+}
+
+async function listenForCode(port: number): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const server = createServer((req, res) => {
+      const url = req.url ?? '/';
+      const parsed = new URL(url, `http://localhost:${String(port)}`);
+      const code = parsed.searchParams.get('code');
+      const error = parsed.searchParams.get('error');
+
+      const respond = (status: number, body: string): void => {
+        res.writeHead(status, { 'Content-Type': 'text/html' });
+        res.end(body);
+      };
+
+      if (error) {
+        respond(400, `<p>Authorization failed: ${error}</p>`);
+        server.close();
+        reject(new Error(`Strava authorization failed: ${error}`));
+        return;
+      }
+
+      if (code) {
+        respond(
+          200,
+          '<p>Authorization successful. You can close this tab and return to the terminal.</p>'
+        );
+        server.close();
+        resolve(code);
+      } else {
+        respond(400, '<p>Missing code in callback URL.</p>');
+        server.close();
+        reject(new Error('Missing code in callback URL'));
+      }
+    });
+
+    server.listen(port, () => {
+      console.error(
+        `Listening for callback on http://localhost:${String(port)}`
+      );
+    });
+
+    server.on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
+async function exchangeCodeForToken(
+  clientId: string,
+  clientSecret: string,
+  code: string
+): Promise<TokenResponse> {
+  const body = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    code,
+    grant_type: 'authorization_code',
+  });
+
+  const res = await fetch(`${STRAVA_API_BASE}/oauth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+
+  const raw: unknown = await res.json();
+  if (!res.ok) {
+    throw new Error(
+      oauthJsonErrorMessage(raw, `Token exchange failed: ${String(res.status)}`)
+    );
+  }
+  return parseTokenResponse(raw);
+}
+
+async function refreshAccessToken(
+  clientId: string,
+  clientSecret: string,
+  refreshToken: string
+): Promise<TokenResponse> {
+  const body = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+  });
+
+  const res = await fetch(`${STRAVA_API_BASE}/oauth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+
+  const raw: unknown = await res.json();
+  if (!res.ok) {
+    throw new Error(
+      oauthJsonErrorMessage(raw, `Token refresh failed: ${String(res.status)}`)
+    );
+  }
+  return parseTokenResponse(raw);
+}
+
+async function fetchActivities(opts: {
+  perPage?: number;
+  page?: number;
+  before?: number;
+  after?: number;
+}): Promise<SummaryActivity[]> {
+  const tokens = getTokens();
+  const params = new URLSearchParams();
+  if (opts.perPage != null && Number.isFinite(opts.perPage)) {
+    params.set('per_page', String(Math.min(200, Math.max(1, opts.perPage))));
+  }
+  if (opts.page != null && Number.isFinite(opts.page)) {
+    params.set('page', String(Math.max(1, opts.page)));
+  }
+  if (opts.before != null && Number.isFinite(opts.before)) {
+    params.set('before', String(opts.before));
+  }
+  if (opts.after != null && Number.isFinite(opts.after)) {
+    params.set('after', String(opts.after));
+  }
+
+  const url = `${STRAVA_API_BASE}/athlete/activities?${params.toString()}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${tokens.access_token}` },
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    let message = `Strava API error: ${String(res.status)} ${res.statusText}`;
+    try {
+      const json: unknown = parseJsonUnknown(body);
+      if (isRecord(json) && 'message' in json) {
+        const apiMessage = json['message'];
+        if (typeof apiMessage === 'string') {
+          message = `Strava API error: ${apiMessage}`;
+        }
+      }
+    } catch {
+      if (body) message += `\n${body}`;
+    }
+    throw new Error(message);
+  }
+
+  const payload: unknown = await res.json();
+  return parseSummaryActivities(payload);
+}
+
+async function fetchActivity(id: number): Promise<Record<string, unknown>> {
+  const tokens = getTokens();
+  const res = await fetch(`${STRAVA_API_BASE}/activities/${String(id)}`, {
+    headers: { Authorization: `Bearer ${tokens.access_token}` },
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    let message = `Strava API error: ${String(res.status)} ${res.statusText}`;
+    try {
+      const json: unknown = parseJsonUnknown(body);
+      if (isRecord(json) && typeof json['message'] === 'string') {
+        message = `Strava API error: ${json['message']}`;
+      }
+    } catch {
+      if (body) message += `\n${body}`;
+    }
+    throw new Error(message);
+  }
+
+  const payload: unknown = await res.json();
+  return parseJsonObject(payload);
+}
+
+function formatDuration(seconds: number): string {
+  const hours = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  if (hours > 0) {
+    return `${String(hours)}h ${String(mins)}m`;
+  }
+  return `${String(mins)}m`;
+}
+
+function formatDistance(meters: number): string {
+  if (meters >= 1000) {
+    return `${(meters / 1000).toFixed(2)} km`;
+  }
+  return `${String(Math.round(meters))} m`;
+}
+
+function formatDate(iso: string): string {
+  const date = new Date(iso);
+  return date.toLocaleString(undefined, {
+    dateStyle: 'short',
+    timeStyle: 'short',
+  });
+}
+
+function printActivitiesTable(activities: SummaryActivity[]): void {
+  if (activities.length === 0) {
+    console.log('No activities found.');
+    return;
+  }
+
+  const maxName = Math.min(
+    40,
+    Math.max(10, ...activities.map((a) => a.name.length))
+  );
+  const header =
+    'Date'.padEnd(18) +
+    'Type'.padEnd(14) +
+    'Name'.padEnd(maxName + 2) +
+    'Distance'.padEnd(12) +
+    'Time';
+  console.log(header);
+  console.log('-'.repeat(header.length));
+
+  for (const activity of activities) {
+    const date = formatDate(activity.start_date_local);
+    const type = (activity.sport_type || activity.type || '').slice(0, 12);
+    const name = activity.name.slice(0, maxName).padEnd(maxName + 2);
+    const distance = formatDistance(activity.distance).padEnd(12);
+    const time = formatDuration(activity.moving_time);
+    console.log(`${date}  ${type.padEnd(14)}${name}${distance}${time}`);
+  }
+}
+
+const program = new Command();
+
+program
+  .name('strava')
+  .description(
+    'CLI to fetch latest activities from Strava (requires STRAVA_ACCESS_TOKEN, obtain via `strava auth`).'
+  );
+
+program
+  .command('doctor')
+  .description(
+    'Check env vars and auth (tokens present and valid or need refresh)'
+  )
+  .action(() => {
+    const storagePath = getStoragePath();
+    let ok = true;
+
+    const clientId = process.env['STRAVA_CLIENT_ID']?.trim();
+    const clientSecret = process.env['STRAVA_CLIENT_SECRET']?.trim();
+
+    if (!clientId) {
+      console.log('STRAVA_CLIENT_ID: not set');
+      ok = false;
+    } else {
+      console.log('STRAVA_CLIENT_ID: set');
+    }
+    if (!clientSecret) {
+      console.log('STRAVA_CLIENT_SECRET: not set');
+      ok = false;
+    } else {
+      console.log('STRAVA_CLIENT_SECRET: set');
+    }
+
+    console.log(`Token file: ${storagePath}`);
+
+    if (!fs.existsSync(storagePath)) {
+      console.log('Auth: no token file. Run `strava auth`.');
+      ok = false;
+    } else {
+      try {
+        const raw = fs.readFileSync(storagePath, 'utf8');
+        const parsed: unknown = parseJsonUnknown(raw);
+        if (!isRecord(parsed)) {
+          console.log(
+            'Auth: token file invalid or unreadable. Run `strava auth` first.'
+          );
+          ok = false;
+        } else {
+          const access = parsed['access_token'];
+          const refresh = parsed['refresh_token'];
+          const exp = parsed['expires_at'];
+          if (typeof access !== 'string' || typeof refresh !== 'string') {
+            console.log(
+              'Auth: token file incomplete. Run `strava auth` first.'
+            );
+            ok = false;
+          } else if (typeof exp !== 'number' || exp < Date.now() / 1000) {
+            console.log('Auth: access token expired. Run `strava refresh`.');
+            ok = false;
+          } else {
+            const secsLeft = Math.round(exp - Date.now() / 1000);
+            console.log(
+              `Auth: OK (expires in ${String(Math.floor(secsLeft / 3600))}h ${String(Math.floor((secsLeft % 3600) / 60))}m)`
+            );
+          }
+        }
+      } catch {
+        console.log(
+          'Auth: token file invalid or unreadable. Run `strava auth` first.'
+        );
+        ok = false;
+      }
+    }
+
+    process.exit(ok ? 0 : 1);
+  });
+
+program
+  .command('auth')
+  .description(
+    'Retrieve access token using client ID and secret (OAuth flow or with --code).'
+  )
+  .option(
+    '--code <code>',
+    'Authorization code from redirect (skips opening browser)'
+  )
+  .option(
+    '--redirect-port <number>',
+    'Port for OAuth callback when not using --code',
+    (v: string) => parseInt(v, 10),
+    DEFAULT_REDIRECT_PORT
+  )
+  .action(async (opts: { code?: string; redirectPort: number }) => {
+    const storagePath = getStoragePath();
+    const { clientId, clientSecret } = getClientCredentials();
+
+    try {
+      let code: string;
+      if (opts.code) {
+        code = opts.code.trim();
+      } else {
+        const redirectUri = `http://localhost:${String(opts.redirectPort)}`;
+        const authUrl = new URL(`${STRAVA_OAUTH_BASE}/authorize`);
+        authUrl.searchParams.set('client_id', clientId);
+        authUrl.searchParams.set('redirect_uri', redirectUri);
+        authUrl.searchParams.set('response_type', 'code');
+        authUrl.searchParams.set('scope', ACTIVITY_READ_SCOPE);
+        const url = authUrl.toString();
+        console.error(
+          'Opening browser for Strava authorization. Set your app callback to',
+          redirectUri
+        );
+        openUrl(url);
+        code = await listenForCode(opts.redirectPort);
+      }
+
+      const tokens = await exchangeCodeForToken(clientId, clientSecret, code);
+      fs.writeFileSync(storagePath, JSON.stringify(tokens, null, 2), 'utf8');
+      console.log(`Tokens saved to ${storagePath}`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+program
+  .command('refresh')
+  .description(
+    'Get a new access token using client ID, secret, and refresh token.'
+  )
+  .action(async () => {
+    const { clientId, clientSecret } = getClientCredentials();
+    const storagePath = getStoragePath();
+    if (!fs.existsSync(storagePath)) {
+      console.error(`${storagePath} does not exist. Run strava auth.`);
+      process.exit(1);
+    }
+
+    const tokensRaw: unknown = parseJsonUnknown(
+      fs.readFileSync(storagePath, 'utf8')
+    );
+    if (!isRecord(tokensRaw)) {
+      console.error(`Invalid token file at ${storagePath}. Run strava auth.`);
+      process.exit(1);
+    }
+    const refreshToken =
+      'refresh_token' in tokensRaw &&
+      typeof tokensRaw['refresh_token'] === 'string'
+        ? tokensRaw['refresh_token']
+        : undefined;
+
+    if (!refreshToken) {
+      console.error(
+        `Refresh token not found in ${storagePath}. Run strava auth.`
+      );
+      process.exit(1);
+    }
+
+    try {
+      const tokens = await refreshAccessToken(
+        clientId,
+        clientSecret,
+        refreshToken
+      );
+      fs.writeFileSync(storagePath, JSON.stringify(tokens, null, 2), 'utf8');
+      console.log(`Tokens saved to ${storagePath}`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+program
+  .command('activity <id>')
+  .description('Fetch a single activity by ID with full details (outputs JSON)')
+  .action(async (idStr: string) => {
+    const id = parseInt(idStr, 10);
+    if (!Number.isFinite(id)) {
+      console.error('Activity ID must be a number');
+      process.exit(1);
+    }
+    try {
+      const activity = await fetchActivity(id);
+      console.log(JSON.stringify(activity, null, 2));
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+program
+  .command('activities')
+  .description('Fetch the latest activities from your Strava profile')
+  .option(
+    '-n, --per-page <number>',
+    'Number of activities per page (1–200)',
+    (v: string) => parseInt(v, 10),
+    30
+  )
+  .option(
+    '-p, --page <number>',
+    'Page number for pagination',
+    (v: string) => parseInt(v, 10),
+    1
+  )
+  .option(
+    '--before <unix>',
+    'Unix timestamp: only activities before this time',
+    (v: string) => parseInt(v, 10)
+  )
+  .option(
+    '--after <unix>',
+    'Unix timestamp: only activities after this time',
+    (v: string) => parseInt(v, 10)
+  )
+  .option('--json', 'Output raw JSON instead of a table')
+  .action(
+    async (opts: {
+      perPage: number;
+      page: number;
+      before?: number;
+      after?: number;
+      json?: boolean;
+    }) => {
+      try {
+        const activities = await fetchActivities({
+          perPage: opts.perPage,
+          page: opts.page,
+          ...(opts.before !== undefined ? { before: opts.before } : {}),
+          ...(opts.after !== undefined ? { after: opts.after } : {}),
+        });
+        if (opts.json) {
+          console.log(JSON.stringify(activities, null, 2));
+        } else {
+          printActivitiesTable(activities);
+        }
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+    }
+  );
+
+export const stravaCommand = program;

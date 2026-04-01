@@ -1,0 +1,45 @@
+{
+  "name": "@kvendrik/strava",
+  "description": "Minimal read-only CLI for Strava (OAuth, list activities, fetch activity details)",
+  "version": "0.1.0",
+  "module": "src/index.ts",
+  "type": "module",
+  "license": "MIT",
+  "author": "Koen Vendrik",
+  "files": [
+    "src",
+    "package.json",
+    "README.md",
+    "AGENT.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "strava": "src/index.ts"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kvendrik/strava"
+  },
+  "bugs": {
+    "url": "https://github.com/kvendrik/strava/issues"
+  },
+  "scripts": {
+    "lint": "tsc --noEmit && eslint .",
+    "lint:fix": "eslint . --fix"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/bun": "latest",
+    "eslint": "^10.1.0",
+    "typescript-eslint": "^8.58.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "commander": "^14.0.3"
+  }
+}
